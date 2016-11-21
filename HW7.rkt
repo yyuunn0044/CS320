@@ -1,0 +1,237 @@
+#lang plai
+
+(require (for-syntax racket/base) racket/match racket/list racket/string
+         (only-in mzlib/string read-from-string-all))
+
+;; build a regexp that matches restricted character expressions, can use only
+;; {}s for lists, and limited strings that use '...' (normal racket escapes
+;; like \n, and '' for a single ')
+(define good-char "(?:[ \t\r\na-zA-Z0-9_{}!?*/<=>:+-]|[.][.][.])")
+;; this would make it awkward for students to use \" for strings
+(define good-string "\"[^\"\\]*(?:\\\\.[^\"\\]*)*\"")
+
+(define expr-re
+  (regexp (string-append "^"
+                         good-char"*"
+                         "(?:'"good-string"'"good-char"*)*"
+                         "$")))
+(define string-re
+  (regexp (string-append "'("good-string")'")))
+
+(define (string->sexpr str)
+  (unless (string? str)
+    (error 'string->sexpr "expects argument of type <string>"))
+    (unless (regexp-match expr-re str)
+      (error 'string->sexpr "syntax error (bad contents)"))
+    (let ([sexprs (read-from-string-all
+                 (regexp-replace*
+                  "''" (regexp-replace* string-re str "\"\\1\"") "'"))])
+    (if (= 1 (length sexprs))
+      (car sexprs)
+      (error 'string->sexpr "bad syntax (multiple expressions)"))))
+
+
+(test/exn (string->sexpr 1) "expects argument of type <string>")
+(test/exn (string->sexpr ".") "syntax error (bad contents)")
+(test/exn (string->sexpr "{} {}") "bad syntax (multiple expressions)")
+
+(define-type KCFAE
+  [num (n number?)]
+  [add (lhs KCFAE?)
+       (rhs KCFAE?)]
+  [sub (lhs KCFAE?)
+       (rhs KCFAE?)]
+  [id (name symbol?)]
+  [fun (param symbol?)
+       (body KCFAE?)]
+  [app (fun-expr KCFAE?)
+       (arg-expr KCFAE?)])
+
+(define-type CKCFAE 
+  [cnum (n number?)]
+  [cadd (lhs CKCFAE?)
+       (rhs CKCFAE?)]
+  [csub (lhs CKCFAE?)
+       (rhs CKCFAE?)]
+  [cid (pos number?)]
+  [cfun (param symbol?)
+       (body CKCFAE?)]
+  [capp (fun-expr CKCFAE?)
+       (arg-expr CKCFAE?)])
+
+(define-type CKCFAE-Value 
+  [numV (n number?)]
+  [closureV (param symbol?)
+            (body CKCFAE?)
+            (ds DefrdSub?)])
+
+(define-type CDefrdSub 
+  [mtCSub]
+  [aCSub (name symbol?)
+         (rest CDefrdSub?)])
+
+(define-type DefrdSub
+  [mtSub]
+  [aSub 
+        (value CKCFAE-Value?)
+        (rest DefrdSub?)])
+
+
+
+(define-type CKCFAE-Cont
+  [mtK]
+  [addSecondK (r CKCFAE?) (ds DefrdSub?) (k CKCFAE-Cont?)]
+  [doAddK (v CKCFAE-Value?) (k CKCFAE-Cont?)]
+  [subSecondK (r CKCFAE?) (ds DefrdSub?) (k CKCFAE-Cont?)]
+  [doSubK (v CKCFAE-Value?) (k CKCFAE-Cont?)]
+  [appArgK (a CKCFAE?) (ds DefrdSub?) (k CKCFAE-Cont?)]
+  [doAppK (v CKCFAE-Value?) (k CKCFAE-Cont?)])
+
+;(define (DefrdSub? x) true)
+
+;; parse-sexpr : S-expr -> KCFAE
+(define (parse-sexpr sexp)
+  (cond
+    [(number? sexp) (num sexp)]
+    [(symbol? sexp) (id sexp)]
+    [(pair? sexp)
+     (case (car sexp)
+       [(+) (add (parse-sexpr (second sexp))
+                 (parse-sexpr (third sexp)))]
+       [(-) (sub (parse-sexpr (second sexp))
+                 (parse-sexpr (third sexp)))]
+       [(fun) (fun (first (second sexp))
+                   (parse-sexpr (third sexp)))]
+       [else (app (parse-sexpr (first sexp))
+                  (parse-sexpr (second sexp)))])]))
+
+
+;; parse: string -> KCFAE
+;; parses a string containing a KCFAE expression to a KCFAE AST
+(define (parse str)
+  (parse-sexpr (string->sexpr str)))
+
+;; compile : KCFAE CDefrdSub -> CKCFAE
+(define (compile kcfae ds)
+  (type-case KCFAE kcfae
+    [num (n) (cnum n)]
+    [add (l r) (cadd (compile l ds) (compile r ds))]
+    [sub (l r) (csub (compile l ds) (compile r ds))]
+    [id (name) (cid (locate name ds))]
+    [fun (param body)
+         (cfun param (compile body (aCSub param ds)))]
+    [app (fun arg) (capp (compile fun ds) (compile arg ds))]))
+    
+    
+;; locate : symbol CDefrdSub -> number
+(define (locate name ds)
+  (type-case CDefrdSub ds
+    [mtCSub () (error 'locate "free variable")]
+    [aCSub (sub-name rest-ds)
+           (if (symbol=? sub-name name)
+               0
+               (+ 1 (locate name rest-ds)))]))
+
+(define ckcfae-reg (cnum 0))
+(define k-reg (mtK))
+(define v-reg (numV 0))
+(define ds-reg empty)
+
+
+;; list-find : DefrdSub number -> CKCFAE-Value
+(define (list-find ds pos)
+  (local [(define newpos pos)]
+    (if (= newpos 0)
+      (aSub-value ds)
+      (list-find (aSub-rest ds) (- pos 1)))))
+
+;; interp : -> CKCFAE-Value
+(define (interp)
+  (type-case CKCFAE ckcfae-reg
+    [cnum (n) (begin
+                (set! v-reg (numV n))
+                (continue))]
+    [cadd (l r)
+          (begin
+            (set! ckcfae-reg l)
+            (set! k-reg (addSecondK
+                         r ds-reg k-reg))
+            (interp))]
+    [csub (l r) 
+          (begin
+            (set! ckcfae-reg l)
+            (set! k-reg (subSecondK
+                         r ds-reg k-reg))
+            (interp))]
+    [cid (pos) (begin
+                 (set! v-reg (list-find ds-reg pos))
+                 (continue))]
+    [cfun (param body) (begin
+                         (set! v-reg (closureV param body ds-reg))
+                         (continue))] ;;;;;;
+    [capp (fun-expr arg-expr) (begin
+                                (set! ckcfae-reg fun-expr)
+                                (set! k-reg (appArgK arg-expr ds-reg k-reg))
+                                (interp))] ;;;;;;;;;;
+    ))
+
+;; continue : -> CKCFAE-Value
+(define (continue)
+  (type-case CKCFAE-Cont k-reg
+    [mtK () v-reg]
+    [addSecondK (r ds k) 
+                (begin
+                  (set! ckcfae-reg r)
+                  (set! ds-reg ds)
+                  (set! k-reg (doAddK v-reg k))
+                  (interp))]
+    [doAddK (v1 k) 
+            (begin 
+              (set! v-reg (numV (+ (numV-n v1) (numV-n v-reg))))
+              (set! k-reg k)
+              (continue))]
+    [subSecondK (r ds k)  
+                (begin
+                  (set! ckcfae-reg r)
+                  (set! ds-reg ds)
+                  (set! k-reg (doSubK v-reg k))
+                  (interp))]
+    [doSubK (v1 k) 
+            (begin 
+              (set! v-reg (numV (- (numV-n v1) (numV-n v-reg))))
+              (set! k-reg k)
+              (continue))]
+    [appArgK (arg-expr ds k) (begin
+                               (set! ckcfae-reg arg-expr)
+                               (set! ds-reg ds)
+                               (set! k-reg (doAppK v-reg k))
+                               (interp))] ;;;;;;;;;;;
+    [doAppK (fun-val k) 
+            (begin
+              (set! ckcfae-reg (closureV-body fun-val))
+              (set! ds-reg (aSub v-reg (closureV-ds fun-val)))
+              (set! k-reg k)
+              (interp))]))
+
+
+;; init : void -> void
+(define (init)
+  (set! k-reg (mtK))
+  (set! v-reg (numV 0))
+  (set! ds-reg (mtSub)))
+
+;; run : string -> CKCFAE-Value
+;; evaluate a KCFAE program contained in a string
+(define (run str)
+  (begin
+    (set! ckcfae-reg (compile (parse str) (mtCSub)))
+    (init)
+    (interp)))
+
+
+(test (run "10") (numV 10))
+(test (run "{+ 10 7}") (numV 17))
+(test (run "{- 10 7}") (numV 3))
+(test (run "{{fun {x} {+ x 12}} {+ 1 17}}") (numV 30))
+(test (run "{{fun {x} {{fun {f} {+ {f 1} {{fun {x} {f 2}} 3}}}
+                       {fun {y} {+ x y}}}} 0}") (numV 3))

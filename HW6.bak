@@ -1,0 +1,286 @@
+#lang plai
+
+(define-type KCFAE
+  [num (n number?)]
+  [add (lhs KCFAE?)
+       (rhs KCFAE?)]
+  [sub (lhs KCFAE?)
+       (rhs KCFAE?)]
+  [id (name symbol?)]
+  [fun (param (listof symbol?))
+       (body KCFAE?)]
+  [app (fun-expr KCFAE?)
+       (arg-expr (listof KCFAE?))]
+  [if0 (test KCFAE?)
+       (then KCFAE?)
+       (else KCFAE?)]
+  [withcc (name symbol?)
+          (body KCFAE?)]
+  [try (trys KCFAE?)
+       (catch symbol?)
+       (catches KCFAE?)]
+  [throw])
+
+(define-type KCFAE-Value
+  [numV (n number?)]
+  [closureV (param (listof symbol?))
+            (body KCFAE?)
+            (sc DefrdSub?)]
+  [contV (proc procedure?)])
+
+(define-type DefrdSub
+  [mtSub]
+  [aSub (name symbol?)
+        (value KCFAE-Value?)
+        (rest DefrdSub?)])
+
+(define-type catchSub
+  [mSub]
+  [aaSub (body KCFAE?)
+        (ds DefrdSub?)
+        (k KCFAE-Value?)
+        (rest catchSub?)])
+
+;; ----------------------------------------
+
+
+
+;;aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+(define (parse-fun funs)
+  (cond
+    [(or (= (length funs) 0) (= (length funs) 1)) (list (first funs))]
+    [else (cons (first funs) (parse-fun (rest funs)))]))
+
+
+(define (parse-app apps)
+  (cond
+    [(= (length apps) 0) (error 'parse "there aren't app arguments")]
+    [(= (length apps) 1) (list (parse (first apps)))]
+    [else (cons (parse (first apps)) (parse-app (rest apps)))]))
+
+;; parse : S-expr -> KCFAE
+(define (parse sexp)
+  (cond
+    [(number? sexp) (num sexp)]
+    [(symbol? sexp) (id sexp)]
+    [(pair? sexp)
+     (case (car sexp)
+       [(+) (add (parse (second sexp)) (parse (third sexp)))]
+       [(-) (sub (parse (second sexp)) (parse (third sexp)))]
+       [(fun) (fun (parse-fun (second sexp)) (parse (third sexp)))]  ;;[(fun) (fun (first (second sexp)) (parse (third sexp)))]  ;;-----ᄆaaaaaaaaaa
+       [(if0) (if0 (parse (second sexp))
+                   (parse (third sexp))
+                   (parse (fourth sexp)))]
+       [(withcc) (withcc (second sexp) (parse (third sexp)))]
+       [(try) (try (parse (second sexp)) (third sexp) (parse (fourth sexp)))]
+       [(throw) (throw)]
+       [else (app (parse (first sexp)) (parse-app (rest sexp)))])]));;----aaaaaaaaaaaaaaaaaaa
+
+(test (parse 3) (num 3))
+(test (parse 'x) (id 'x))
+(test (parse '{+ 1 2}) (add (num 1) (num 2)))
+(test (parse '{- 1 2}) (sub (num 1) (num 2)))
+(test (parse '{fun {x e} z}) (fun (list 'x 'e) (id 'z)))
+(test (parse '{1 2}) (app (num 1) (list (num 2))))
+(test (parse '{if0 0 1 2}) (if0 (num 0) (num 1) (num 2)))
+(test (parse '{withcc x 2}) (withcc 'x (num 2)))
+
+;; ----------------------------------------
+
+;; interp : KCFAE DefrdSub (KCFAE-Value -> alpha) -> alpha
+(define (interp-args args c ds k acc)
+  (cond
+    [(= (length args) 0) (k acc)]
+    [else (interp (first args) c ds 
+                  (lambda (arg-val)
+                    (interp-args (rest args) c ds k (append acc (list arg-val)))))]))
+
+(define (makesubs param arg-val ds)
+  (if (= (length param) (length arg-val))
+      (make param arg-val ds)
+      (error 'parse "not same parameter, arguments")))
+
+(define (make param arg-val ds)
+  (cond
+    [(= (length param) 0) ds]
+    [(= (length param) 1) (aSub (first param) (first arg-val) ds)]
+    [else (aSub (first param) (first arg-val) (make (rest param) (rest arg-val) ds))]))
+
+   
+(define (interp a-fae c ds k)
+  (type-case KCFAE a-fae
+    [num (n) (k (numV n))]
+    [add (l r) (interp l c ds
+                       (lambda (v1)
+                         (interp r c ds
+                                 (lambda (v2)
+                                   (k (num+ v1 v2))))))]
+    [sub (l r) (interp l c ds
+                       (lambda (v1)
+                         (interp r c ds
+                                 (lambda (v2)
+                                   (k (num- v1 v2))))))]
+    [id (name) (k (lookup name ds))]
+    [fun (param body-expr)
+         (k (closureV param body-expr ds))]
+    [app (fun-expr arg-expr)
+         (interp fun-expr c ds
+                 (lambda (fun-val)
+                   (type-case KCFAE-Value fun-val
+                     [closureV (param body ds)
+                               (interp-args arg-expr c ds (lambda (arg-val-list)
+                                                          (interp body c (makesubs param arg-val-list ds) k)) '())]
+                     [contV (k)
+                            (interp (first arg-expr) c ds 
+                                       (lambda (arg-val) (k arg-val)))]
+                     [else (error 'interp "not a function")])))]
+    [if0 (test-expr then-expr else-expr)
+         (interp test-expr c ds
+                 (lambda (v)
+                   (if (numzero? v)
+                       (interp then-expr c ds k)
+                       (interp else-expr c ds k))))]
+    [withcc (id body-expr)
+            (interp body-expr c  
+                    (aSub id
+                          (contV k)
+                          ds)
+                    k)
+                  ]
+    [try (trys catch catches)
+         (interp trys 
+                 (aaSub catches
+                       ds
+                       k
+                       c) ds
+                 k)]
+    [throw () (local [(define (cat) (first c))
+                      (define (other) (rest c))]
+                (interp (aaSub-body cat) (other) (aaSub-ds cat) (aaSub-k cat)))]))
+
+;;((fun (x) ((fun (f) (+ (f 1) ((fun (x) (f 2)) 3))) (fun (y) (+ x y)))) 0)
+
+;; num-op : (number number -> number) -> (KCFAE-Value KCFAE-Value -> KCFAE-Value)
+(define (num-op op op-name)
+  (lambda (x y)
+    (numV (op (numV-n x) (numV-n y)))))
+
+(define num+ (num-op + '+))
+(define num- (num-op - '-))
+
+;; numzero? : KCFAE-Value -> boolean
+(define (numzero? x)
+  (zero? (numV-n x)))
+
+(define (lookup name ds)
+  (type-case DefrdSub ds
+    [mtSub () (error 'lookup "free variable")]
+    [aSub (sub-name num rest-sc)
+          (if (symbol=? sub-name name)
+              num
+              (lookup name rest-sc))]))
+
+(test/exn (lookup 'x (mtSub)) "free variable")
+(test (lookup 'x (aSub 'x (numV 9) (mtSub))) (numV 9))
+(test (lookup 'x (aSub 'y (numV 10) (aSub 'x (numV 9) (mtSub)))) (numV 9))
+
+;; interp-expr : KCFAE -> KCFAE-Value
+(define (interp-expr a-fae)
+  (type-case KCFAE-Value (interp a-fae (mSub) (mtSub) (lambda (x) x))
+    [numV (n) n]
+    [closureV (param body ds) 'function]
+    [contV (k) 'function]))
+
+
+(test (interp-expr (parse 10)) 10)
+(test (interp-expr (parse '{fun {x} x})) 'function)
+(test (interp-expr (parse '{withcc x x})) 'function)
+
+(test (interp-expr (parse '{+ 10 7})) 17)
+(test (interp-expr (parse '{- 10 7})) 3)
+(test (interp-expr (parse '{{fun {x} {+ x 12}}
+                            {+ 1 17}}))
+      30)
+(test (interp-expr (parse '{{fun {x y} {+ x 12}}
+                            {+ 1 17} 3}))
+      30)
+(test (interp-expr (parse'{{fun {x} {{fun {f} {+ {f 1}
+                                                 {{fun {x} {f 2}}
+                                                  3}}}
+                                     {fun {y} {+ x y}}}}
+                           0}))
+      3)
+(test (parse '{withcc k {k 10}})
+      10)
+(test (interp-expr (parse '{withcc k {k 10}}))
+      10)
+
+(test (interp-expr (parse '{withcc k
+                                   {+ {k 10}
+                                      17}}))
+      10)
+
+;; Check for eager evaluation:
+(test/exn (interp-expr (parse '{{fun {x} 0}
+                                {1 {fun {y} y}}}))
+          "not a function")
+
+(define (run expr)
+  (interp-expr (parse expr))
+  )
+
+(test 'aaaaaaaaaaaaaaa 'aaaaaaaaaaaaaaa)
+
+  (test (run '{- 0 {withcc k {+ {k 10} 17}}}) -10)
+  (test (run '{- 0 {withcc k {+ 1 {withcc c {k {+ {c 10} 17}}}}}}) -11)
+  (test (run '{+ 5 {withcc k {+ 1000 {k 5}}}}) 10)
+  (test (run '{- 0 {withcc k {+ 15 {k 3}}}}) -3)
+  (test (run '{withcc a {- 0 {withcc b {b 15}}}}) -15)
+  (test (run '{{{fun {x y} {fun {c} {+ {+ x y} c}}} 1 2} 3}) 6)
+  (test (run '{if0 {withcc esc {+ 3 {esc 1}}} 10 {- 0 10}}) -10)
+  (test (run '{if0 {withcc esc {+ 3 {esc 0}}} 10 {- 0 10}}) 10)
+  (test (run '{- 0 {withcc esc {{fun {f} {f 3}} esc}}}) -3)
+  (test (run '{{fun {x y} {- y x}} 10 12}) 2)
+  (test (run '{fun {x} {fun {} x}}) 'function)
+  (test (run '{{{fun {x} {fun {} x}} 13}}) 13)
+  (test (run '{withcc esc {{fun {x y} x} 1 {esc 3}}}) 3)
+  (test (run '{+ 3 {withcc k {+ 5 {k 9}}}}) 12)
+  (test (run '{{withcc k {fun {x y} {+ x y}}} 4 5}) 9)
+  (test (run '{+ {withcc k {k 5}} 4} ) 9)
+  (test (run '{{fun {f x} {f f x}} {fun {g y} {if0 {- y 1} 1 {+ y {g g {- y 1}}}}} 10}) 55) ; recursive function
+  (test (run '{withcc done {{fun {f x} {f f x}} {fun {g y} {if0 {- y 1} {done 100} {+ y {g g {- y 1}}}}} 10}}) 100) ; exit from recursive function using continuation
+  (test (run '{withcc k {- 0 {k 100}}} ) 100)
+  (test (run '{withcc k {k {- 0 100}}} ) -100)
+  (test (run '{withcc k {k {+ 100 11}}} ) 111)
+  (test (run '{{fun {a b c} {- {+ {withcc k {+ {k 100} a}} b} c}} 100 200 300} ) 0)
+  (test (run '{withcc esc {{fun {x y} x} 1 {esc 3}}}) 3)
+  (test (run '{{withcc esc {{fun {x y} {fun {z} {+ z y}}} 1 {withcc k {esc k}}}} 10}) 20)
+  (test (run '{try {{fun {f x} {f f x}} {fun {g y} {if0 {- y 1} {throw} {+ y {g g {- y 1}}}}} 10} catch 110}) 110) ; exit from recursive function using try-catch
+  (test (run '{{fun {f x} {f f x}} {fun {g y} {if0 {- y 1} {throw} {try {+ y {g g {- y 1}}} catch y}}} 10}) 54) ; test for multiple recursive try-catch
+  (test (run '{withcc done {{fun {f x} {f f x}} {fun {g y} {if0 {- y 1} {throw} {try {+ y {g g {- y 1}}} catch {done y}}}} 10}}) 2)
+  (test (run '{try {{fun {f x} {f f x}} {fun {g y} {if0 {- y 1} {throw} {try {+ y {g g {- y 1}}} catch {throw}}}} 10} catch 20110464}) 20110464) ; recursive try-catch throwing (1)
+  (test (run '{try {{fun {x y z} {a b c}} 1 2 {throw}} catch 0}) 0)
+  (test (run '{{fun {f} {try {f 3} catch 8}} {fun {x} {throw}}}) 8)
+  (test (run '{try {- 0 {withcc k {+ 3 {k {throw}}}}} catch 89}) 89)
+  (test (run '{try {+ 3 {withcc k {+ 1000 {k {throw}}}}} catch 11}) 11)
+  (test (run '{{fun {x y z} {try {+ 1 {+ x {throw}}} catch {+ y z}}} 1 2 3}) 5)
+  (test (run '{+ {try {- 10 {throw}} catch 3} 10}) 13)
+  (test (run '{try {if0 0 {throw} {+ 1 2}} catch {if0 10 1 {try {throw} catch 54}}})   54)
+  (test (run '{try {withcc a {+ 1 {withcc b {throw}}}} catch 10}) 10)
+  (test (run '{try {- 0 {throw}} catch 5}) 5)
+  (test (run '{try {if0 {throw} 3 4} catch 5}) 5)
+  (test (run '{try {{fun {x y} {try x catch y}} {throw} 0} catch -1}) -1)
+  (test (run '{try {try {throw} catch {throw}} catch 9}) 9)
+  (test (run '{{withcc esc {try {{withcc k {esc k}} 0} catch {fun {x} 8}}} {fun {x} {throw}}}) 8)
+  (test (run '{{withcc esc {try {{withcc k {try {esc k} catch {fun {x} {fun {y} 9}}}} 0} catch {fun {x} 8}}} {fun {x} {throw}}}) 8)
+  (test (run '{withcc foo {{fun {x y} {y x}} {+ 2 3} {withcc bar {+ 1 {bar foo}}}}}) 5)
+  (test (run '{try {withcc zzz {{fun {x y z w} {+ {+ x y} {+ z w}}} 1 2 {zzz 10} {throw}}} catch 42}) 10)
+  (test (run '{try {withcc zzz {{fun {x y z w} {+ {+ x y} {+ z w}}} 1 2 {throw} {zzz 10}}} catch 42}) 42)
+  (test (run '{try {withcc zzz {{fun {x y z w} {+ {w {+ x y}} {+ {throw} z}}} 1 2 3 zzz}} catch 42}) 3)
+  (test (run '{withcc esc {try {+ {throw} {esc 3}} catch 4}}) 4)
+  (test (run '{withcc esc {{fun {x y} {+ {+ x 3} y}} {withcc k {try {k {esc {throw}}} catch {k 5}}} 7}}) 15)
+  (test (run '{try {withcc x {+ {x 1} {throw}}} catch 0}) 1)
+  (test (run '{+ 12 {withcc k {+ 1 {k {{fun {} 7}}}}}}) 19)
+  
+  (define x 3)
+(test 3 (list? (second '(fun (x) x))))

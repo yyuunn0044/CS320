@@ -1,0 +1,24 @@
+#lang plai
+
+(define-type WAE
+  [num (n number?)]
+  [add (lhs WAE?) (rhs WAE?)]
+  [sub (lhs WAE?) (rhs WAE?)]
+  [with (name symbol?) (named-expr WAE?) (body WAE?)]
+  [id (name symbol?)])
+
+
+; free-ids : WAE → list-of-sym
+
+(define (free-ids wae)
+  (type-case WAE wae
+    [num (n) (list '())]
+    [add (l r) (append free-ids(l) free-ids(r))]
+    [sub (l r) (append free-ids(l) free-ids(r))]
+    [with (x i b) ]
+    [id (s) (list (s))]
+   ))
+
+; binding-ids : WAE → list-of-sym
+
+; bound-ids : WAE → list-of-sym

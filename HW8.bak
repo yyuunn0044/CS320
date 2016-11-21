@@ -1,0 +1,296 @@
+#lang plai-typed
+
+(define-type TFAE
+  [num (n : number)]
+  [add (lhs : TFAE)
+       (rhs : TFAE)]
+  [sub (lhs : TFAE)
+       (rhs : TFAE)]
+  [id (name : symbol)]
+  [fun (param : symbol)
+       (paramty : TE)
+       (body : TFAE)]
+  [app (fun-expr : TFAE)
+       (arg-expr : TFAE)])
+
+(define-type TE
+  [numTE]
+  [boolTE]
+  [arrowTE (param : TE)
+           (result : TE)])
+
+(define-type TFAE-Value
+  [numV (n : number)]
+  [closureV (param : symbol)
+            (body : TFAE)
+            (ds : DefrdSub)])
+
+(define-type DefrdSub
+  [mtSub]
+  [aSub (name : symbol)
+        (value : TFAE-Value)
+        (rest : DefrdSub)])
+
+(define-type Type
+  [numT]
+  [boolT]
+  [arrowT (param : Type)
+          (result : Type)])
+
+(define-type TypeEnv
+  [mtEnv]
+  [aBind (name : symbol)
+         (type : Type)
+         (rest : TypeEnv)])
+
+;; ----------------------------------------
+
+;; interp : TFAE DefrdSub -> TFAE-Value
+(define (interp tfae ds)
+  (type-case TFAE tfae
+    [num (n) (numV n)]
+    [add (l r) (num+ (interp l ds) (interp r ds))]
+    [sub (l r) (num- (interp l ds) (interp r ds))]
+    [id (name) (lookup name ds)]
+    [fun (param param-te body-expr)
+         (closureV param body-expr ds)]
+    [app (fun-expr arg-expr)
+         (local [(define fun-val (interp fun-expr ds))
+                 (define arg-val (interp arg-expr ds))]
+           (interp (closureV-body fun-val)
+                   (aSub (closureV-param fun-val)
+                         arg-val
+                         (closureV-ds fun-val))))]))
+
+;; num-op : (number number -> number) -> (TFAE-Value TFAE-Value -> TFAE-Value)
+(define (num-op op x y)
+  (numV (op (numV-n x) (numV-n y))))
+
+(define (num+ x y) (num-op + x y))
+(define (num- x y) (num-op - x y))
+
+(define (lookup name ds)
+  (type-case DefrdSub ds
+    [mtSub () (error 'lookup "free variable")]
+    [aSub (sub-name num rest-ds)
+          (if (symbol=? sub-name name)
+              num
+              (lookup name rest-ds))]))
+
+;; ----------------------------------------
+
+(define (get-type name-to-find env)
+  (type-case TypeEnv env
+    [mtEnv () (error 'get-type "free variable, so no type")]
+    [aBind (name ty rest)
+           (if (symbol=? name-to-find name)
+               ty
+               (get-type name-to-find rest))]))
+
+;; ----------------------------------------
+
+(define (parse-type te)
+  (type-case TE te
+    [numTE () (numT)]
+    [boolTE () (boolT)]
+    [arrowTE (a b) (arrowT (parse-type a)
+                           (parse-type b))]))
+
+(define (type-error tfae msg)
+  (error 'typecheck (string-append
+                     "no type: "
+                     (string-append
+                      (to-string tfae)
+                      (string-append " not "
+                                     msg)))))
+
+(define typecheck : (TFAE TypeEnv -> Type)
+  (lambda (tfae env)
+    (type-case TFAE tfae
+      [num (n) (numT)]
+      [add (l r) (type-case Type (typecheck l env)
+                   [numT ()
+                         (type-case Type (typecheck r env)
+                           [numT () (numT)]
+                           [else (type-error r "num")])]
+                   [else (type-error l "num")])]
+      [sub (l r) (type-case Type (typecheck l env)
+                   [numT ()
+                         (type-case Type (typecheck r env)
+                           [numT () (numT)]
+                           [else (type-error r "num")])]
+                   [else (type-error l "num")])]
+      [id (name) (get-type name env)]
+      [fun (name te body)
+           (local [(define param-type (parse-type te))]
+             (arrowT param-type
+                     (typecheck body (aBind name
+                                            param-type
+                                            env))))]
+      [app (fn arg)
+           (type-case Type (typecheck fn env)
+             [arrowT (param-type result-type)
+                     (if (equal? param-type
+                                 (typecheck arg env))
+                         result-type
+                         (type-error arg
+                                     (to-string param-type)))]
+             [else (type-error fn "function")])])))
+
+;; ----------------------------------------
+
+(test (interp (num 10)
+              (mtSub))
+      (numV 10))
+(test (interp (add (num 10) (num 17))
+              (mtSub))
+      (numV 27))
+(test (interp (sub (num 10) (num 7))
+              (mtSub))
+      (numV 3))
+(test (interp (app (fun 'x (numTE) (add (id 'x) (num 12)))
+                   (add (num 1) (num 17)))
+              (mtSub))
+      (numV 30))
+(test (interp (id 'x)
+              (aSub 'x (numV 10) (mtSub)))
+      (numV 10))
+
+(test (interp (app (fun 'x (numTE)
+                        (app (fun 'f (arrowTE (numTE) (numTE))
+                                  (add (app (id 'f) (num 1))
+                                       (app (fun 'x (numTE)
+                                                 (app (id 'f)
+                                                      (num 2)))
+                                            (num 3))))
+                             (fun 'y (numTE)
+                                  (add (id 'x) (id 'y)))))
+                   (num 0))
+              (mtSub))
+      (numV 3))
+
+(test/exn (interp (id 'x) (mtSub))
+          "free variable")
+
+(test (typecheck (num 10) (mtEnv))
+      (numT))
+
+(test (typecheck (add (num 10) (num 17)) (mtEnv))
+      (numT))
+(test (typecheck (sub (num 10) (num 7)) (mtEnv))
+      (numT))
+
+(test (typecheck (fun 'x (numTE) (add (id 'x) (num 12))) (mtEnv))
+      (arrowT (numT) (numT)))
+
+(test (typecheck (fun 'x (numTE) (fun 'y (boolTE) (id 'x))) (mtEnv))
+      (arrowT (numT) (arrowT (boolT)  (numT))))
+
+(test (typecheck (app (fun 'x (numTE) (add (id 'x) (num 12)))
+                      (add (num 1) (num 17)))
+                 (mtEnv))
+      (numT))
+
+(test (typecheck (app (fun 'x (numTE)
+                           (app (fun 'f (arrowTE (numTE) (numTE))
+                                     (add (app (id 'f) (num 1))
+                                          (app (fun 'x (numTE) (app (id 'f) (num 2)))
+                                               (num 3))))
+                                (fun 'y (numTE)
+                                     (add (id 'x)
+                                          (id' y)))))
+                      (num 0))
+                 (mtEnv))
+      (numT))
+
+(test/exn (typecheck (app (num 1) (num 2)) (mtEnv))
+          "no type")
+
+(test/exn (typecheck (add (fun 'x (numTE) (num 12))
+                          (num 2))
+                     (mtEnv))
+          "no type")
+
+
+;----------------------------------------------------------------------
+
+(test (interp (eq (num 13)
+                  (ifthenelse (eq (num 1) (add (num -1) (num 2)))
+                              (num 12)
+                              (num 13)))
+              (mtSub))
+      (boolV false))
+
+(test (typecheck (eq (num 13)
+                     (ifthenelse (eq (num 1) (add (num -1) (num 2)))
+                                 (num 12)
+                                 (num 13)))
+                 (mtEnv))
+      (boolT))
+(test/exn (typecheck (add (num 1)
+                          (ifthenelse (bool true)
+                                      (bool true)
+                                      (bool false)))
+                     (mtEnv))
+          "no type")
+
+(test (interp (fst (pair (num 10) (num 8))) (mtSub)) (numV 10))
+(test (interp (snd (pair (num 10) (num 8))) (mtSub)) (numV 8))
+(test (typecheck (pair (num 10) (num 8)) (mtEnv)) (crossT (numT) (numT)))
+(test (typecheck (add (num 1) (snd (pair (num 10) (num 8)))) (mtEnv)) (numT))
+(test (typecheck (fun ’x (crossTE (numTE) (boolTE))
+                      (ifthenelse (snd (id ’x)) (num 0) (fst (id ’x))))
+                 (mtEnv))
+      (arrowT (crossT (numT) (boolT)) (numT)))
+(test/exn (typecheck (fst (num 10)) (mtEnv)) "no type")
+(test/exn (typecheck (add (num 1) (fst (pair (bool false) (num 8)))) (mtEnv)) "no type")
+(test/exn (typecheck (fun ’x (crossTE (numTE) (boolTE))
+                          (ifthenelse (fst (id ’x)) (num 0) (fst (id ’x))))
+                     (mtEnv))
+          "no type")
+
+(test (run (app (fun (list) (list) (num 10)) (list))) (numV 10))
+(test (run (app (fun (list 'x 'y) (list (numTE) (numTE))
+                        (sub (id 'x) (id 'y))) (list (num 10) (num 20))))
+      (numV -10))
+(test (typecheck (app (fun (list 'x 'y) (list (numTE) (boolTE))
+                           (id 'y))
+                      (list (num 10) (bool false)))
+                 (mtEnv))
+      (boolT))
+(test/exn (typecheck (app (fun (list 'x 'y) (list (numTE) (boolTE))
+                               (id 'y))
+                          (list (num 10) (num 10)))
+                     (mtEnv))
+          "no type")
+
+(test (typecheck (throw) (mtEnv)) (anyT))
+(test (typecheck (try1 (num 8) (num 10)) (mtEnv)) (numT))
+(test (typecheck (try1 (throw) (num 10)) (mtEnv)) (numT))
+(test/exn (typecheck (try1 (num 8) (bool false)) (mtEnv)) "no type")
+(test (typecheck (ifthenelse (throw) (num 1) (num 2)) (mtEnv)) (numT))
+(test/exn (typecheck (app (throw) (list (ifthenelse (num 1) (num 2) (num 3)))) (mtEnv)) "no type")
+(test/exn (typecheck (add (bool true) (throw)) (mtEnv)) "no type")
+(test (typecheck (fst (throw)) (mtEnv)) (anyT))
+(test (typecheck (ifthenelse (bool true) (pair (num 1) (throw)) (pair (throw) (bool false))) (mtEnv)) (crossT (numT) (boolT)))
+
+(test (typecheck (add (throw) (throw)) (mtEnv)) (numT))
+(test (typecheck (app (throw) (list (num 10) (num 10))) (mtEnv)) (anyT))
+(test (typecheck (try1 (add (num 1) (throw)) (throw)) (mtEnv)) (numT))
+(test (typecheck (ifthenelse (bool false) (num 2) (throw)) (mtEnv)) (numT))
+(test (typecheck (ifthenelse (bool false) (throw) (num 2)) (mtEnv)) (numT))
+(test (typecheck (ifthenelse (bool false) (throw) (throw)) (mtEnv)) (anyT))
+(test (typecheck (pair (num 2) (bool false)) (mtEnv)) (crossT (numT) (boolT)))
+(test (typecheck (pair (num 2) (throw)) (mtEnv)) (crossT (numT) (anyT)))
+(test (typecheck (snd (throw)) (mtEnv)) (anyT))
+(test (typecheck (snd (pair (num 2) (bool false))) (mtEnv)) (boolT))
+(test (typecheck (fun empty empty (num 2)) (mtEnv)) (arrowT empty (numT)))
+(test (typecheck (fun (list 'x) (list (numTE)) (throw)) (mtEnv)) (arrowT (list (numT)) (anyT)))
+(test (typecheck (app (fun empty empty (num 2)) empty) (mtEnv)) (numT))
+(test (typecheck (app (throw) (list (num 2) (bool false))) (mtEnv)) (anyT))
+(test (typecheck (app (fun (list 'x 'y) (list (numTE) (numTE)) (add (id 'x) (id 'y))) (list (num 2) (num 3))) (mtEnv)) (numT))
+(test (typecheck (with (list 'x) (list (numTE)) (list (num 2)) (id 'x)) (mtEnv)) (numT))
+(test (typecheck (with (list 'x) (list (numTE)) (list (throw)) (id 'x)) (mtEnv)) (numT))
+(test (typecheck (with (list 'x 'y 'z) (list (boolTE) (numTE) (numTE)) (list (bool false) (num 2) (num 3)) (ifthenelse (id 'x) (id 'y) (id 'z))) (mtEnv)) (numT))
+(test (typecheck (with empty empty empty (num 2)) (mtEnv)) (numT))
+(test (typecheck (with (list 'x) (list (numTE)) (list (throw)) (num 2)) (mtEnv)) (numT))
